@@ -1,0 +1,265 @@
+/////////////////////config.py
+
+from selenium.webdriver.chrome.options import Options
+
+FIREBASE_CREDENTIALS_PATH = "/Users/kaantankarabulut/Desktop/Developer/WebFetching/politika-13050-firebase-adminsdk-kg4xy-1244cca38f.json"
+
+CHROME_OPTIONS = Options()
+CHROME_OPTIONS.add_argument("--headless")
+CHROME_OPTIONS.add_argument("--lang=en-US")
+CHROME_OPTIONS.add_argument("--disable-dev-shm-usage")
+CHROME_OPTIONS.add_argument("--no-sandbox")
+
+MAX_NEWS_PER_POLITICIAN = 5
+
+
+/////////////////////////firebase_manager.py
+
+import firebase_admin
+from firebase_admin import credentials, firestore
+from config import FIREBASE_CREDENTIALS_PATH
+
+
+def initialize_firebase():
+    cred = credentials.Certificate(FIREBASE_CREDENTIALS_PATH)
+    firebase_admin.initialize_app(cred)
+    return firestore.client()
+
+
+def update_firestore(db, politician, news_list):
+    existing_news = (
+        db.collection("news").where("politician_id", "==", politician["id"]).get()
+    )
+    existing_news_dict = {doc.to_dict()["link"]: doc for doc in existing_news}
+
+    for news_item in news_list:
+        if news_item["link"] in existing_news_dict:
+            doc_ref = existing_news_dict[news_item["link"]].reference
+            doc_ref.update(news_item)
+        else:
+            db.collection("news").add(news_item)
+
+    all_news = (
+        db.collection("news").where("politician_id", "==", politician["id"]).get()
+    )
+    sorted_news = sorted(
+        all_news, key=lambda x: x.to_dict()["upload_time"], reverse=True
+    )
+
+    for doc in sorted_news[5:]:
+        doc.reference.delete()
+
+
+///////////////////////////////main.py
+
+import json
+import pandas as pd
+from config import CHROME_OPTIONS
+from firebase_manager import initialize_firebase
+from politician_manager import process_politicians  # Updated import
+from selenium import webdriver
+
+
+def main():
+    db = initialize_firebase()
+    driver = webdriver.Chrome(options=CHROME_OPTIONS)
+
+    try:
+        all_news = process_politicians(db, driver)
+
+        # Save to JSON file
+        with open("news_data.json", "w") as json_file:
+            json.dump(all_news, json_file, indent=4)
+
+        # Save to Excel file
+        df = pd.DataFrame(all_news)
+        df.to_excel("news_data.xlsx", index=False)
+
+        print(
+            "All politicians and their news have been processed and uploaded to Firebase Firestore. "
+            "News data has been saved to news_data.json and news_data.xlsx"
+        )
+    finally:
+        driver.quit()
+
+
+if __name__ == "__main__":
+    main()
+
+
+//////////////////////////////////news_fetcher.py
+
+from datetime import datetime
+from selenium.webdriver.common.by import By
+import uuid
+from utils import translate_time
+from firebase_manager import update_firestore
+
+
+def fetch_news(driver, politician):
+    search_term = f"{politician['name']} {politician['title']}"
+    url = f"https://www.google.com/search?q={search_term.replace(' ', '+')}&tbm=nws"
+    driver.get(url)
+
+    news_results = driver.find_elements(By.CSS_SELECTOR, "div#rso > div >div>div>div")
+    news_list = []
+
+    for news_div in news_results:
+        try:
+            news_item = process_news_item(news_div, politician)
+            news_list.append(news_item)
+        except Exception as e:
+            print(f"Error processing news item: {e}")
+
+    return news_list
+
+
+def process_news_item(news_div, politician):
+    news_item = {}
+    news_item["link"] = news_div.find_element(By.TAG_NAME, "a").get_attribute("href")
+
+    divs_inside_news = news_div.find_elements(By.CSS_SELECTOR, "a>div>div>div")
+
+    for i, new in enumerate(divs_inside_news):
+        if i == 1:
+            news_item["domain"] = new.text
+        elif i == 2:
+            news_item["title"] = new.text
+        elif i == 3:
+            news_item["description"] = new.text
+        elif i == 4:
+            news_item["date"] = translate_time(new.text)
+
+    news_item["id"] = str(uuid.uuid4())
+    news_item["upload_time"] = datetime.now().isoformat()
+    news_item["politician_id"] = politician["id"]
+    news_item["politician_name"] = politician["name"]
+    news_item["politician_title"] = politician["title"]
+
+    return news_item
+
+
+def fetch_and_update_news(db, driver, politician):
+    news_list = fetch_news(driver, politician)
+    update_firestore(db, politician, news_list)
+    return news_list
+
+
+///////////////////////////////////////politician_manager.py
+
+import uuid
+from politicians_data import politicians
+from news_fetcher import fetch_and_update_news
+
+
+def update_or_create_politician(db, politician_data):
+    query = db.collection("politicians").where("title", "==", politician_data["title"])
+    docs = query.stream()
+
+    for doc in docs:
+        doc_ref = db.collection("politicians").document(doc.id)
+        doc_ref.update(politician_data)
+        print(f"Updated existing politician: {politician_data['name']}")
+        return doc.to_dict()
+
+    politician_data["id"] = str(uuid.uuid4())
+    db.collection("politicians").add(politician_data)
+    print(f"Created new politician: {politician_data['name']}")
+    return politician_data
+
+
+def process_politicians(db, driver):
+    all_news = []
+    for politician in politicians:
+        try:
+            updated_politician = update_or_create_politician(db, politician)
+            print(f"Fetching news for {updated_politician['name']}")
+            position_news = fetch_and_update_news(db, driver, updated_politician)
+            all_news.extend(position_news)
+        except Exception as e:
+            print(f"Error processing {politician['name']}: {str(e)}")
+    return all_news
+
+
+///////////////////////////////////politicians_data.py
+
+def create_politician(
+    name, title, biography, image_name, highlights, country, born_year, position
+):
+    return {
+        "name": name,
+        "title": title,
+        "biography": biography,
+        "image_name": image_name,
+        "highlights": highlights,
+        "country": country,
+        "born_year": born_year,
+        "position": position,
+    }
+
+
+politicians = [
+    create_politician(
+        name="Cevdet Yılmaz",
+        title="Vice President of Turkey",
+        biography="""
+        Cevdet Yılmaz (born 1 April 1967, Bingöl) is a Turkish politician who has served in various governmental roles. 
+        He has been a Member of Parliament since 2007 and has held positions such as Minister of Development and Minister of State. 
+        Yılmaz is known for his work in economic policy and development planning. He became Vice President of Turkey in 2023.
+        """,
+        image_name="https://trthaberstatic.cdn.wp.trt.com.tr/resimler/2056000/cevdet-yilmaz-aa-2056105.jpg",
+        highlights=[
+            {"icon": "calendar", "text": "1967"},
+            {
+                "icon": "graduationcap",
+                "text": "Middle East Technical University / Public Administration / 1988",
+            },
+            {"icon": "person.3.fill", "text": "Justice and Development Party / 2001"},
+        ],
+        country="Turkey",
+        born_year=1967,
+        position="turVicePres",
+    )
+    # create_politician(
+    #     name="Recep Tayyip Erdoğan",
+    #     title="President of Turkey",
+    #     biography="""
+    #     Recep Tayyip Erdoğan (born 26 February 1954) is a Turkish politician serving as the current President of Turkey.
+    #     He previously served as Prime Minister from 2003 to 2014 and as Mayor of Istanbul from 1994 to 1998.
+    #     Erdoğan has been the leader of the Justice and Development Party (AKP) since 2001.
+    #     He is known for his conservative policies and has been a significant figure in Turkish politics for over two decades.
+    #     """,
+    #     image_name="https://upload.wikimedia.org/wikipedia/commons/thumb/b/ba/Turkish_President_Recep_Tayyip_Erdo%C4%9Fan_in_January_2024_%28cropped%29.jpg/1200px-Turkish_President_Recep_Tayyip_Erdo%C4%9Fan_in_January_2024_%28cropped%29.jpg",
+    #     highlights=[
+    #         {"icon": "calendar", "text": "1954"},
+    #         {
+    #             "icon": "graduationcap",
+    #             "text": "Marmara University / Business Administration / 1981",
+    #         },
+    #         {"icon": "person.3.fill", "text": "Justice and Development Party / 2001"},
+    #     ],
+    #     country="Turkey",
+    #     born_year=1954,
+    #     position="turPresident",
+    # ),
+    # Add more politicians here...
+]
+
+
+/////////////////////////////utils.py
+
+def translate_time(turkish_time):
+    translations = {
+        "saat önce": "hour ago",
+        "dakika önce": "minute ago",
+        "gün önce": "day ago",
+        "hafta önce": "week ago",
+        "ay önce": "month ago",
+        "yıl önce": "year ago",
+    }
+    for tr, en in translations.items():
+        if tr in turkish_time:
+            number = turkish_time.split()[0]
+            return f"{number} {en}"
+    return turkish_time
+
